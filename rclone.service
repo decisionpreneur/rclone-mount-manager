@@ -1,0 +1,59 @@
+[felix@gemini ~]$ cat /etc/systemd/system/rclone.service
+[Unit]
+Description=RClone Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/rclone mount gmedia: /gmedia \
+   --allow-other \
+   --dir-cache-time=160h \
+   --cache-chunk-size=10M \
+   --cache-info-age=168h \
+   --cache-workers=5 \
+   --cache-tmp-upload-path /data/rclone_upload \
+   --cache-tmp-wait-time 60m \
+   --buffer-size 0M \
+   --syslog \
+   --umask 002 \
+   --rc \
+   --log-level INFO
+ExecStop=/usr/bin/sudo /usr/bin/fusermount -uz /gmedia
+Restart=on-abort
+User=felix
+Group=felix
+
+[Install]
+WantedBy=default.target
+# /etc/systemd/system/rclone.service
+[Unit]
+Description=Google Drive (rclone)
+AssertPathIsDirectory=/mnt/google-drive
+After=plexdrive.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/rclone mount \
+        --config=/root/.config/rclone/rclone.conf \
+        --allow-other \
+        --cache-tmp-upload-path=/tmp/rclone/upload \
+        --cache-chunk-path=/tmp/rclone/chunks \
+        --cache-workers=8 \
+        --cache-writes \
+        --cache-dir=/tmp/rclone/vfs \
+        --cache-db-path=/tmp/rclone/db \
+        --no-modtime \
+        --drive-use-trash \
+        --stats=0 \
+        --checkers=16 \
+        --bwlimit=40M \
+        --dir-cache-time=60m \
+        --cache-info-age=60m gdrive:/ /mnt/google-drive
+ExecStop=/bin/fusermount -u /mnt/google-drive
+Restart=always
+RestartSec=10
+CPUQuota=10%
+
+[Install]
+WantedBy=default.target
