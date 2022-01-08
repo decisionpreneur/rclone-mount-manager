@@ -14,7 +14,7 @@ readonly CONF_F=~/.config/rclone/rclone.conf
 readonly CONF_BACKUP=/var/backups/rclone.conf
 readonly LOGS_D=/var/tmp/log/rclone
 readonly CPUS=$(grep -c processor /proc/cpuinfo)
-readonly MNT_DEFS=( --vfs-cache-mode full --log-level INFO --cache-tmp-upload-path=/tmp/rclone/upload --cache-chunk-path=/tmp/rclone/chunks 
+readonly MNT_DEFS=(--allow-root --vfs-cache-mode full --log-level INFO --cache-tmp-upload-path=/tmp/rclone/upload --cache-chunk-path=/tmp/rclone/chunks 
  --cache-workers="${CPUS}" --cache-writes --cache-dir=/tmp/rclone/cachevfs --cache-db-path=/tmp/rclone/db --checkers="${CPUS}" --transfers "${CPUS}" --daemon )
 readonly CPUQUOTA="10"
 readonly NI="19"
