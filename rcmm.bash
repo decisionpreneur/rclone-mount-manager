@@ -43,6 +43,34 @@ declare -a BACKEND=()
 command -v nice >/dev/null 2>&1 && BACKEND+=(nice -"${NI}")
 command -v ionice >/dev/null 2>&1 && BACKEND+=(ionice --class "${IONI}" -n7)
 BACKEND+=("${RCLONE_EXE}")
+declare -a NETWORK_COMPRESSION_DEFS=()
+
+function configure_network_compression() {
+	local help mode level
+	help=$("${RCLONE_EXE}" help backend compress 2>/dev/null || true)
+	if grep -Eq '"xz"' <<<"${help}"; then
+		mode=xz
+		level=9
+	elif grep -Eq '"lzma"' <<<"${help}"; then
+		mode=lzma
+		level=9
+	elif grep -Eq '"zstd"' <<<"${help}"; then
+		mode=zstd
+		if grep -Eiq 'zstd.*levels.*9|levels 0 to 9|0-9' <<<"${help}"; then
+			level=9
+		else
+			level=4
+		fi
+	elif grep -Eq '"gzip"' <<<"${help}"; then
+		mode=gzip
+		level=9
+	else
+		return
+	fi
+	NETWORK_COMPRESSION_DEFS=(--compress-mode "${mode}" --compress-level "${level}")
+}
+
+configure_network_compression
 
 function run_maybe_sudo() {
 	if command -v sudo >/dev/null 2>&1 && [[ "$(id -u)" != 0 ]]; then
@@ -61,7 +89,16 @@ function ensure_mount_root() {
 }
 
 function run_rclone() {
-	"${BACKEND[@]}" "$@"
+	local arg
+	for arg in "$@"; do
+		case "${arg}" in
+			--no-gzip-encoding|--no-gzip-encoding=*)
+				echo '--no-gzip-encoding is blocked by rcmm network compression policy.' >&2
+				exit 2
+			;;
+		esac
+	done
+	"${BACKEND[@]}" "${NETWORK_COMPRESSION_DEFS[@]}" "$@"
 }
 
 function listmounts() {
@@ -87,7 +124,7 @@ function mountone() {
 		[ -d "${LOGS_D}" ] ||  mkdir -p "${LOGS_D}"
 		[ -d "${MNT_ROOT}/${mnt_name}" ] ||  mkdir -p "${MNT_ROOT}/${mnt_name}"
 		sudo logrotate /etc/logrotate.d/rclone.logrotate || sudo rsync -uv --progress "${MYREALDIR}"/etc/logrotate.d/rclone.logrotate /etc/logrotate.d/rclone.logrotate && sudo logrotate /etc/logrotate.d/rclone.logrotate
-		${BACKEND[*]} mount "${mnt_name}:" "${MNT_ROOT}/${mnt_name}" --log-file="${LOGS_D}/${mnt_name}.log" ${MNT_DEFS[*]} ${DEFS[*]} ${*}
+		run_rclone mount "${mnt_name}:" "${MNT_ROOT}/${mnt_name}" --log-file="${LOGS_D}/${mnt_name}.log" "${MNT_DEFS[@]}" "${DEFS[@]}" "$@"
 	fi
 }
 
