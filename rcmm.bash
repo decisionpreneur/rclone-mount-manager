@@ -10,7 +10,7 @@ readonly ME=$(realpath $(which "${0}"))
 readonly MYREALDIR=$(dirname "${ME}")
 readonly MNT_ROOT=/mnt/r
 readonly DEFS=(--fast-list)
-readonly CONF_F=~/.config/rclone/rclone.conf
+readonly CONF_F=${RCLONE_CONFIG:-~/.config/rclone/rclone.conf}
 readonly CONF_BACKUP=/var/backups/rclone.conf
 readonly LOGS_D=/var/tmp/log/rclone
 readonly CPUS=$(grep -c processor /proc/cpuinfo)
@@ -19,14 +19,50 @@ readonly MNT_DEFS=(--allow-root --vfs-cache-mode full --log-level INFO --cache-t
 readonly CPUQUOTA="10"
 readonly NI="19"
 readonly IONI="3"
-readonly BACKEND=(nice -"${NI}" ionice --class "${IONI}" -n7 rclone)
 readonly G="$(id -g)"
 
-if [ ! -e "${MNT_ROOT}" ]; then
-	sudo mkdir -p "${MNT_ROOT}"
-	sudo chgrp "${G}" "${MNT_ROOT}"
-	sudo chmod g+rwxs "${MNT_ROOT}"
-fi
+function resolve_rclone_bin() {
+	local candidate
+	for candidate in "${RCLONE_BIN:-}" rclone rclone.exe /c/utils/rclone/rclone.exe; do
+		[[ -n "${candidate}" ]] || continue
+		if command -v "${candidate}" >/dev/null 2>&1; then
+			command -v "${candidate}"
+			return
+		fi
+		if [[ -x "${candidate}" ]]; then
+			printf '%s\n' "${candidate}"
+			return
+		fi
+	done
+	echo 'rclone was not found.' >&2
+	exit 1
+}
+
+readonly RCLONE_EXE=$(resolve_rclone_bin)
+declare -a BACKEND=()
+command -v nice >/dev/null 2>&1 && BACKEND+=(nice -"${NI}")
+command -v ionice >/dev/null 2>&1 && BACKEND+=(ionice --class "${IONI}" -n7)
+BACKEND+=("${RCLONE_EXE}")
+
+function run_maybe_sudo() {
+	if command -v sudo >/dev/null 2>&1 && [[ "$(id -u)" != 0 ]]; then
+		sudo "$@"
+	else
+		"$@"
+	fi
+}
+
+function ensure_mount_root() {
+	if [ ! -e "${MNT_ROOT}" ]; then
+		run_maybe_sudo mkdir -p "${MNT_ROOT}"
+		run_maybe_sudo chgrp "${G}" "${MNT_ROOT}" || true
+		run_maybe_sudo chmod g+rwxs "${MNT_ROOT}" || true
+	fi
+}
+
+function run_rclone() {
+	"${BACKEND[@]}" "$@"
+}
 
 function listmounts() {
 	mount ${*} | grep rclone
@@ -42,6 +78,7 @@ function apply_limits() {
 function mountone() {
 	local mnt_name=${1}
 	shift # past mount name
+	ensure_mount_root
 	local presence=$(("${ME}" ps | grep -v bash; "${ME}" mount) | grep "${mnt_name}")
 	if [[ "${presence}" != '' ]]; then
 		echo "${mnt_name} already mounted:"
@@ -169,12 +206,12 @@ while [ ${#} -gt 0 ]; do
 		;;
 		'list')
                         shift # past action
-			rclone listremotes ${*} | sed 's/\:$//g'
+			run_rclone listremotes "$@" | sed 's/\:$//g'
+			exit
 		;;
 		*)
-			${BACKEND[*]} ${DEFS[*]} ${*}
-			cpulimit -p $! -l "${CPUQUOTA}"
-                        shift # past action
+			run_rclone "${DEFS[@]}" "$@"
+			exit
 		;;
 	esac
 done
