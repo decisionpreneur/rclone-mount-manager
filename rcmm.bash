@@ -98,7 +98,7 @@ function run_rclone() {
 			;;
 		esac
 	done
-	"${BACKEND[@]}" "$@" "${NETWORK_COMPRESSION_DEFS[@]}"
+	exec "${BACKEND[@]}" "$@" "${NETWORK_COMPRESSION_DEFS[@]}"
 }
 
 function listmounts() {
