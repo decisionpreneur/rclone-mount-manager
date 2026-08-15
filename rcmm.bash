@@ -40,8 +40,13 @@ function resolve_rclone_bin() {
 
 readonly RCLONE_EXE=$(resolve_rclone_bin)
 declare -a BACKEND=()
-command -v nice >/dev/null 2>&1 && BACKEND+=(nice -"${NI}")
-command -v ionice >/dev/null 2>&1 && BACKEND+=(ionice --class "${IONI}" -n7)
+case "$(uname -s 2>/dev/null || true)" in
+	MSYS*|MINGW*|CYGWIN*) ;;
+	*)
+		command -v nice >/dev/null 2>&1 && BACKEND+=(nice -"${NI}")
+		command -v ionice >/dev/null 2>&1 && BACKEND+=(ionice --class "${IONI}" -n7)
+	;;
+esac
 BACKEND+=("${RCLONE_EXE}")
 declare -a NETWORK_COMPRESSION_DEFS=()
 
