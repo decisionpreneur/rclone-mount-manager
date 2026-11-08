@@ -33,15 +33,19 @@ python_bin=$(command -v python3 || command -v python)
 target=${1}
 case $(uname -s) in
 	MSYS*|MINGW*|CYGWIN*)
-		case ${target} in
-			/drives/[a-zA-Z]|/drives/[a-zA-Z]/*)
-				drive=${target#/drives/}
-				suffix=${drive:1}
-				target="${drive:0:1}:${suffix:-/}"
-				;;
-			*) target=$(cygpath -am -- "$(realpath -m -- "${target}")") ;;
-		esac
-		rclone_bin=$(cygpath -am -- "${rclone_bin}")
+		to_native_path() {
+			local drive suffix
+			case ${1} in
+				/drives/[a-zA-Z]|/drives/[a-zA-Z]/*)
+					drive=${1#/drives/}
+					suffix=${drive:1}
+					printf '%s\n' "${drive:0:1}:${suffix:-/}"
+					;;
+				*) cygpath -am -- "$(realpath -m -- "${1}")" ;;
+			esac
+		}
+		target=$(to_native_path "${target}")
+		rclone_bin=$(to_native_path "${rclone_bin}")
 		unset PYTHONHOME PYTHONPATH
 		export MSYS2_ARG_CONV_EXCL='*' MSYS_NO_PATHCONV=1
 		;;
