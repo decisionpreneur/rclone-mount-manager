@@ -103,12 +103,16 @@ def matches(path, metadata):
 def prepare(path, metadata):
     """Accept plaintext or compressed bytes only when they match the source MD5."""
     report("READ", path)
-    if path.stat().st_size == metadata["Size"] and matches(path, metadata):
+    if (metadata["MD5"] is not None and path.stat().st_size == metadata["Size"]
+            and matches(path, metadata)):
         return None
     data = read_bytes(path)
     with decoder(data) as stream:
         _, digest = fingerprint(stream.read, path, "DECODE", metadata["Size"])
-    if digest != metadata["MD5"]:
+    if metadata["MD5"] is None:
+        metadata["MD5"] = digest
+        report("DERIVED_MD5", path, digest)
+    elif digest != metadata["MD5"]:
         raise InvalidPayload("Decoded MD5 differs from the source metadata")
     return data
 
@@ -154,7 +158,21 @@ def expected_payload(original, metadata):
     return original + "." + size + {2: ".gz", 4: ".zst"}[metadata["Mode"]]
 
 
-def convert(sidecar, metadata, payload_names):
+def filename_metadata(payload_names):
+    if len(payload_names) != 1:
+        raise InvalidPayload("Metadata is absent and the original has several or no payloads")
+    encoded = ENCODED.fullmatch(next(iter(payload_names)))
+    if encoded is None:
+        raise InvalidPayload("Metadata is required for an uncompressed .bin payload")
+    raw_size = base64.urlsafe_b64decode(encoded[2] + "=")
+    size = int.from_bytes(raw_size, "little")
+    if (size >= 2 ** 63
+            or base64.urlsafe_b64encode(raw_size).decode().rstrip("=") != encoded[2]):
+        raise InvalidPayload("The encoded original size is invalid")
+    return {"Mode": {"gz": 2, "zst": 4}[encoded[3]], "Size": size, "MD5": None}
+
+
+def convert(sidecar, metadata, payload_names, has_sidecar):
     original = sidecar.name[:-5]
     if not original or original in (".", ".."):
         raise InvalidPayload("Invalid original filename")
@@ -168,13 +186,18 @@ def convert(sidecar, metadata, payload_names):
 
     source = None
     data = None
+    validated_payload = None
+    if metadata["MD5"] is None:
+        source = payloads[0]
+        data = prepare(source, metadata)
+        validated_payload = source
     if destination.exists():
         if destination.is_symlink() or not destination.is_file():
             raise InvalidPayload("Original name is occupied by another object")
         # This also resumes a completed rewrite whose sidecar remains.
         data = prepare(destination, metadata)
         source = destination
-    else:
+    elif source is None:
         problems = []
         for candidate in payloads:
             try:
@@ -187,7 +210,7 @@ def convert(sidecar, metadata, payload_names):
             raise InvalidPayload("; ".join(problems) or "The data payload is absent")
 
     for extra in payloads:
-        if extra != source and not redundant(extra, metadata):
+        if extra not in (source, validated_payload) and not redundant(extra, metadata):
             raise InvalidPayload("Distinct data shares the original name: " + str(extra))
 
     stamp = source.stat()
@@ -223,7 +246,8 @@ def convert(sidecar, metadata, payload_names):
     for extra in payloads:
         if extra != source:
             extra.unlink()
-    sidecar.unlink()
+    if has_sidecar:
+        sidecar.unlink()
     report("OK", destination, metadata["Size"])
     return metadata["Size"]
 
@@ -259,12 +283,18 @@ def scan_directory(directory, selected):
                 or (selected_encoded and selected_encoded[1] == original)):
             continue
         try:
-            metadata = metadata_for(directory / name)
+            has_sidecar = True
+            try:
+                metadata = metadata_for(directory / name)
+            except FileNotFoundError:
+                metadata = filename_metadata(payloads.get(name, set()))
+                has_sidecar = False
+                report("FILENAME_METADATA", directory / name[:-5], metadata["Size"])
             if metadata is None:
                 if name in payloads:
                     raise InvalidPayload("Encoded payload has unrelated metadata")
                 continue
-            records.append((name, metadata, payloads.get(name, set())))
+            records.append((name, metadata, payloads.get(name, set()), has_sidecar))
         except (json.JSONDecodeError, UnicodeError) as error:
             if name in payloads:
                 report("ERROR", directory / name, str(error))
@@ -284,9 +314,9 @@ def convert_records(directory, records):
         report("DIRECTORY", directory)
     failures = 0
     completed = total = 0
-    for name, metadata, data_names in records:
+    for name, metadata, data_names, has_sidecar in records:
         try:
-            total += convert(directory / name, metadata, data_names)
+            total += convert(directory / name, metadata, data_names, has_sidecar)
             completed += 1
         except (OSError, ValueError, EOFError, MemoryError, zlib.error, zstd.ZstdError) as error:
             report("ERROR", directory / name, str(error))
