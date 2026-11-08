@@ -12,17 +12,21 @@ sys.dont_write_bytecode = True
 
 import argparse
 import base64
+from concurrent.futures import ThreadPoolExecutor
 from compression import zstd
 import gzip
 import hashlib
 import os
 from pathlib import Path
+from queue import Queue
 import re
+from threading import Lock
 import time
 import zlib
 
 CHUNK = 8 * 1024 * 1024
 ENCODED = re.compile(r"^(.+)\.([A-Za-z0-9_-]{11})\.(gz|zst)$")
+OUTPUT_LOCK = Lock()
 
 
 class InvalidPayload(ValueError):
@@ -31,7 +35,8 @@ class InvalidPayload(ValueError):
 
 def report(phase, path, amount=None):
     suffix = "" if amount is None else " " + str(amount)
-    print(phase + " " + str(path) + suffix, flush=True)
+    with OUTPUT_LOCK:
+        print(phase + " " + str(path) + suffix, flush=True)
 
 
 def fingerprint(stream, path, phase, size=None, retain=False):
@@ -120,7 +125,7 @@ def metadata_for(path):
             or re.fullmatch(r"[0-9a-fA-F]{32}", obj["MD5"]) is None):
         raise InvalidPayload("Invalid rclone-compress metadata")
     obj["MD5"] = obj["MD5"].lower()
-    return obj
+    return {name: obj[name] for name in fields}
 
 
 def expected_payload(original, metadata):
@@ -203,9 +208,8 @@ def convert(sidecar, metadata, payload_names):
     return metadata["Size"]
 
 
-def process_directory(directory, selected):
+def scan_directory(directory, selected):
     import json
-    report("DIRECTORY", directory)
     names, children = set(), []
     with os.scandir(directory) as entries:
         for entry in entries:
@@ -252,6 +256,13 @@ def process_directory(directory, selected):
     if selected is not None and len(records) != 1:
         raise InvalidPayload("The path must identify exactly one rclone-compress object")
     records.sort(key=lambda row: len(row[0]))
+    return children, records, failures
+
+
+def convert_records(directory, records):
+    if records:
+        report("DIRECTORY", directory)
+    failures = 0
     completed = total = 0
     for name, metadata, data_names in records:
         try:
@@ -260,7 +271,39 @@ def process_directory(directory, selected):
         except (OSError, ValueError, EOFError, MemoryError, zlib.error, zstd.ZstdError) as error:
             report("ERROR", directory / name, str(error))
             failures += 1
-    return children, completed, total, failures
+    return completed, total, failures
+
+
+def directory_plans(root, selected):
+    """Overlap directory reads; keep all payload rewrites in the calling thread."""
+    ready = Queue()
+    lock = Lock()
+    pending = 1
+    scanned = 0
+    with ThreadPoolExecutor() as pool:
+        def scan(directory):
+            nonlocal pending, scanned
+            try:
+                children, records, failures = scan_directory(directory, selected)
+            except Exception as error:
+                report("ERROR", directory, str(error))
+                children, records, failures = [], [], 1
+            with lock:
+                if selected is None:
+                    pending += len(children)
+                    for child in children:
+                        pool.submit(scan, child)
+                ready.put((directory, records, failures))
+                scanned += 1
+                if scanned % 100 == 0:
+                    report("SCANNED", root, scanned)
+                pending -= 1
+                if pending == 0:
+                    ready.put(None)
+
+        pool.submit(scan, root)
+        while (plan := ready.get()) is not None:
+            yield plan
 
 
 def main():
@@ -270,22 +313,18 @@ def main():
     report("START", target)
     directory_target = target.is_dir()
     selected = None if directory_target else target.name
-    pending = [target if directory_target else target.parent]
+    root = target if directory_target else target.parent
     completed = total = failures = 0
-    while pending:
-        directory = pending.pop()
-        try:
-            children, count, size, errors = process_directory(directory, selected)
-            completed += count
-            total += size
-            failures += errors
-            if directory_target:
-                pending.extend(children)
-        except (OSError, ValueError, MemoryError) as error:
-            report("ERROR", directory, str(error))
-            failures += 1
-        report("TOTAL", target, "%d files; %d bytes; %d errors" %
-               (completed, total, failures))
+    for directory, records, scan_errors in directory_plans(root, selected):
+        count, size, errors = convert_records(directory, records)
+        completed += count
+        total += size
+        failures += errors + scan_errors
+        if records or scan_errors:
+            report("TOTAL", target, "%d files; %d bytes; %d errors" %
+                   (completed, total, failures))
+    report("FINISHED", target, "%d files; %d bytes; %d errors" %
+           (completed, total, failures))
     return 1 if failures else 0
 
 
