@@ -3,7 +3,8 @@
 
 Usage: uncompress-inplace.py PATH
 A directory is processed recursively; a file selects its own pair.
-Decompression uses RAM. Writes replace the existing payload before renaming it.
+Compressed input is buffered in RAM; decoded data is streamed in large blocks.
+Writes replace the existing payload before renaming it.
 The caller must have exclusive write access to the selected files. An interrupted
 in-place write can leave an incomplete payload; metadata stays until completion.
 """
@@ -14,8 +15,10 @@ import argparse
 import base64
 from concurrent.futures import ThreadPoolExecutor
 from compression import zstd
+from contextlib import contextmanager
 import gzip
 import hashlib
+import io
 import os
 from pathlib import Path
 from queue import Queue
@@ -39,42 +42,58 @@ def report(phase, path, amount=None):
         print(phase + " " + str(path) + suffix, flush=True)
 
 
-def fingerprint(stream, path, phase, size=None, retain=False):
-    data = bytearray(size) if retain else None
+@contextmanager
+def descriptor(path, flags):
+    handle = os.open(path, flags | getattr(os, "O_BINARY", 0))
+    try:
+        yield handle
+    finally:
+        os.close(handle)
+
+
+def read_bytes(path):
+    with descriptor(path, os.O_RDONLY) as handle, io.BytesIO() as buffer:
+        while chunk := os.read(handle, CHUNK):
+            buffer.write(chunk)
+        return buffer.getvalue()
+
+
+def fingerprint(read, path, phase, size=None):
     digest = hashlib.md5(usedforsecurity=False)
     count = 0
     next_report = time.monotonic() + 10
-    while chunk := stream.read(CHUNK):
+    while chunk := read(CHUNK):
         end = count + len(chunk)
         if size is not None and end > size:
             raise InvalidPayload("Decoded data exceeds the metadata size")
         digest.update(chunk)
-        if data is not None:
-            data[count:end] = chunk
         count = end
         if time.monotonic() >= next_report:
             report(phase, path, count)
             next_report = time.monotonic() + 10
     if size is not None and count != size:
         raise InvalidPayload("Expected %d bytes, read %d" % (size, count))
-    return count, digest.hexdigest(), data
+    return count, digest.hexdigest()
 
 
 def raw_fingerprint(path):
-    with path.open("rb") as stream:
-        count, digest, _ = fingerprint(stream, path, "VERIFY")
-    return count, digest
+    with descriptor(path, os.O_RDONLY) as handle:
+        return fingerprint(lambda count: os.read(handle, count), path, "VERIFY")
 
 
-def decoder(path):
-    with path.open("rb") as stream:
-        magic = stream.read(4)
-    if magic[:2] == b"\x1f\x8b":
-        return gzip.open(path, "rb")
-    number = int.from_bytes(magic, "little")
-    if magic == b"\x28\xb5\x2f\xfd" or 0x184D2A50 <= number <= 0x184D2A5F:
-        return zstd.ZstdFile(path, "rb")
-    raise InvalidPayload("Payload is neither the original data nor gzip/zstd")
+@contextmanager
+def decoder(data):
+    magic = data[:4]
+    with io.BytesIO(data) as source:
+        if magic[:2] == b"\x1f\x8b":
+            with gzip.GzipFile(fileobj=source, mode="rb") as stream:
+                yield stream
+        elif (magic == b"\x28\xb5\x2f\xfd"
+              or 0x184D2A50 <= int.from_bytes(magic, "little") <= 0x184D2A5F):
+            with zstd.ZstdFile(source, "rb") as stream:
+                yield stream
+        else:
+            raise InvalidPayload("Payload is neither the original data nor gzip/zstd")
 
 
 def matches(path, metadata):
@@ -86,9 +105,9 @@ def prepare(path, metadata):
     report("READ", path)
     if path.stat().st_size == metadata["Size"] and matches(path, metadata):
         return None
-    with decoder(path) as stream:
-        _, digest, data = fingerprint(
-            stream, path, "DECODE", metadata["Size"], retain=True)
+    data = read_bytes(path)
+    with decoder(data) as stream:
+        _, digest = fingerprint(stream.read, path, "DECODE", metadata["Size"])
     if digest != metadata["MD5"]:
         raise InvalidPayload("Decoded MD5 differs from the source metadata")
     return data
@@ -102,8 +121,8 @@ def redundant(path, metadata):
     nominal = (int.from_bytes(base64.urlsafe_b64decode(encoded[2] + "="), "little")
                if encoded else None)
     try:
-        with decoder(path) as stream:
-            size, digest, _ = fingerprint(stream, path, "READ-EXTRA")
+        with decoder(read_bytes(path)) as stream:
+            size, digest = fingerprint(stream.read, path, "READ-EXTRA")
     except (InvalidPayload, EOFError, gzip.BadGzipFile, zlib.error, zstd.ZstdError):
         return encoded is not None
     if (size, digest) == (metadata["Size"], metadata["MD5"]):
@@ -113,8 +132,7 @@ def redundant(path, metadata):
 
 def metadata_for(path):
     import json
-    with path.open("r", encoding="utf-8") as stream:
-        obj = json.load(stream)
+    obj = json.loads(read_bytes(path))
     fields = {"Mode", "Size", "MD5", "MimeType"}
     if not isinstance(obj, dict) or not fields.issubset(obj):
         return None
@@ -174,18 +192,20 @@ def convert(sidecar, metadata, payload_names):
 
     stamp = source.stat()
     if data is not None:
-        report("WRITE", source, len(data))
+        report("WRITE", source, metadata["Size"])
         # O_TRUNC and write-only sequential IO also work on cache-off mounts.
         # O_CREAT is deliberately absent: a removed source is not recreated.
-        descriptor = os.open(source, os.O_WRONLY | os.O_TRUNC | getattr(os, "O_BINARY", 0))
-        with os.fdopen(descriptor, "wb", buffering=0) as stream:
-            view = memoryview(data)
+        with decoder(data) as stream, descriptor(source, os.O_WRONLY | os.O_TRUNC) as handle:
             offset = 0
             next_report = time.monotonic() + 10
-            while offset < len(view):
-                written = stream.write(view[offset:offset + CHUNK])
-                if not written:
-                    raise OSError("The in-place write made no progress")
+            while chunk := stream.read(CHUNK):
+                view = memoryview(chunk)
+                written = 0
+                while written < len(view):
+                    count = os.write(handle, view[written:])
+                    if not count:
+                        raise OSError("The in-place write made no progress")
+                    written += count
                 offset += written
                 if time.monotonic() >= next_report:
                     report("WRITE", source, offset)
