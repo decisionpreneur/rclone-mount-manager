@@ -195,6 +195,7 @@ def convert(directory, metadata_name, item, rename_once):
 
 def process_directory(directory, selected, rename_once):
     names, directories, encoded_metadata = set(), [], set()
+    payloads = {}
     with os.scandir(directory) as entries:
         for entry in entries:
             if entry.is_symlink():
@@ -210,9 +211,13 @@ def process_directory(directory, selected, rename_once):
     for name in names:
         match = ENCODED.fullmatch(name)
         if match:
-            encoded_metadata.add(match[1] + ".json")
+            metadata_name = match[1] + ".json"
+            encoded_metadata.add(metadata_name)
+            payloads.setdefault(metadata_name, set()).add(name)
         elif name.endswith(".bin") and name[:-4] + ".json" in names:
-            encoded_metadata.add(name[:-4] + ".json")
+            metadata_name = name[:-4] + ".json"
+            encoded_metadata.add(metadata_name)
+            payloads.setdefault(metadata_name, set()).add(name)
     candidates = encoded_metadata | {name for name in names if name.endswith(".json")}
     failures = 0
     recognised = []
@@ -229,6 +234,8 @@ def process_directory(directory, selected, rename_once):
                 if metadata_name in encoded_metadata:
                     raise ValueError("The paired metadata is not an rclone-compress object")
                 continue
+            if payloads.get(metadata_name) != {item[1]}:
+                raise ValueError("Multiple data files claim the same original filename")
             if selected is None or selected in (metadata_name, item[0], item[1]):
                 recognised.append((metadata_name, item))
         except (json.JSONDecodeError, UnicodeError) as error:
