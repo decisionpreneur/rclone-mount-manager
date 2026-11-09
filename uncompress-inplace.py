@@ -51,10 +51,18 @@ def descriptor(path, flags):
         os.close(handle)
 
 
-def read_bytes(path):
+def read_bytes(path, size=None):
     with descriptor(path, os.O_RDONLY) as handle, io.BytesIO() as buffer:
-        while chunk := os.read(handle, CHUNK):
+        remaining = size
+        while remaining is None or remaining:
+            chunk = os.read(handle, CHUNK if remaining is None else min(CHUNK, remaining))
+            if not chunk:
+                if remaining:
+                    raise EOFError("File ended before its listed size: " + str(path))
+                break
             buffer.write(chunk)
+            if remaining is not None:
+                remaining -= len(chunk)
         return buffer.getvalue()
 
 
@@ -76,9 +84,21 @@ def fingerprint(read, path, phase, size=None):
     return count, digest.hexdigest()
 
 
-def raw_fingerprint(path):
+def raw_fingerprint(path, size):
     with descriptor(path, os.O_RDONLY) as handle:
-        return fingerprint(lambda count: os.read(handle, count), path, "VERIFY")
+        remaining = size
+
+        def read(count):
+            nonlocal remaining
+            if not remaining:
+                return b""
+            chunk = os.read(handle, min(count, remaining))
+            if not chunk:
+                raise EOFError("File ended before its expected size: " + str(path))
+            remaining -= len(chunk)
+            return chunk
+
+        return fingerprint(read, path, "VERIFY", size)
 
 
 @contextmanager
@@ -97,16 +117,16 @@ def decoder(data):
 
 
 def matches(path, metadata):
-    return raw_fingerprint(path) == (metadata["Size"], metadata["MD5"])
+    return raw_fingerprint(path, metadata["Size"]) == (metadata["Size"], metadata["MD5"])
 
 
 def prepare(path, metadata):
     """Accept plaintext or compressed bytes only when they match the source MD5."""
     report("READ", path)
-    if (metadata["MD5"] is not None and path.stat().st_size == metadata["Size"]
-            and matches(path, metadata)):
+    size = path.stat().st_size if metadata["MD5"] is not None else None
+    if size == metadata["Size"] and matches(path, metadata):
         return None
-    data = read_bytes(path)
+    data = read_bytes(path, size)
     with decoder(data) as stream:
         _, digest = fingerprint(stream.read, path, "DECODE", metadata["Size"])
     if metadata["MD5"] is None:
@@ -119,13 +139,14 @@ def prepare(path, metadata):
 
 def redundant(path, metadata):
     """Distinguish a duplicate or an incomplete encoded payload from another file."""
-    if path.stat().st_size == metadata["Size"] and matches(path, metadata):
+    stored_size = path.stat().st_size
+    if stored_size == metadata["Size"] and matches(path, metadata):
         return True
     encoded = ENCODED.fullmatch(path.name)
     nominal = (int.from_bytes(base64.urlsafe_b64decode(encoded[2] + "="), "little")
                if encoded else None)
     try:
-        with decoder(read_bytes(path)) as stream:
+        with decoder(read_bytes(path, stored_size)) as stream:
             size, digest = fingerprint(stream.read, path, "READ-EXTRA")
     except (InvalidPayload, EOFError, gzip.BadGzipFile, zlib.error, zstd.ZstdError):
         return encoded is not None
@@ -134,9 +155,9 @@ def redundant(path, metadata):
     return nominal is not None and size != nominal
 
 
-def metadata_for(path):
+def metadata_for(path, size=None):
     import json
-    obj = json.loads(read_bytes(path))
+    obj = json.loads(read_bytes(path, size))
     fields = {"Mode", "Size", "MD5", "MimeType"}
     if not isinstance(obj, dict) or not fields.issubset(obj):
         return None
@@ -254,7 +275,7 @@ def convert(sidecar, metadata, payload_names, has_sidecar):
 
 def scan_directory(directory, selected):
     import json
-    names, children = set(), []
+    names, children, metadata_sizes = set(), [], {}
     with os.scandir(directory) as entries:
         for entry in entries:
             if entry.is_symlink() or entry.is_junction():
@@ -263,6 +284,8 @@ def scan_directory(directory, selected):
                 children.append(directory / entry.name)
             elif entry.is_file(follow_symlinks=False):
                 names.add(entry.name)
+                if entry.name.endswith(".json"):
+                    metadata_sizes[entry.name] = entry.stat(follow_symlinks=False).st_size
 
     payloads = {}
     for name in names:
@@ -285,7 +308,7 @@ def scan_directory(directory, selected):
         try:
             has_sidecar = True
             try:
-                metadata = metadata_for(directory / name)
+                metadata = metadata_for(directory / name, metadata_sizes.get(name))
             except FileNotFoundError:
                 metadata = filename_metadata(payloads.get(name, set()))
                 has_sidecar = False
@@ -299,7 +322,7 @@ def scan_directory(directory, selected):
             if name in payloads:
                 report("ERROR", directory / name, str(error))
                 failures += 1
-        except (OSError, ValueError) as error:
+        except (OSError, ValueError, EOFError) as error:
             report("ERROR", directory / name, str(error))
             failures += 1
 
